@@ -18,6 +18,16 @@ MAX_FILE_LINES = 200
 
 LOG_DIRS = ("/var/log",)
 
+# Roots the disk scanner may walk. Read-only, but du is slow on a big tree,
+# so it is scoped to the places a human actually asks about.
+DISK_SCAN_ROOTS = (
+    os.path.expanduser("~"),
+    "/var",
+    "/tmp",
+    "/opt",
+    "/srv",
+)
+
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
 TRANSCRIPT_DIR = os.path.expanduser("~/.whybroke/transcripts")

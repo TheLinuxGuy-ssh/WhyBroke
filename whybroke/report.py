@@ -52,7 +52,7 @@ def parse(text):
     return sections
 
 
-def render(sections, question=None):
+def render(sections, question=None, evidence_corpus=None):
     lines = []
     if question:
         lines.append("# whybroke report")
@@ -68,3 +68,28 @@ def render(sections, question=None):
         "This report suggests fixes only. whybroke never applies changes to the system."
     )
     return "\n".join(lines)
+
+
+_SIZE_RE = re.compile(r"\b\d[\d,.]*\s?(?:[KMGT]i?B|bytes?)\b", re.IGNORECASE)
+
+
+def ungrounded_evidence(sections, corpus):
+    """Find sizes in EVIDENCE that do not appear in any real tool output.
+
+    A small model will occasionally invent a file size. This catches the
+    number so the harness can say so instead of passing it off as a finding.
+    """
+    evidence = sections.get("EVIDENCE") or ""
+    if not evidence or not corpus:
+        return []
+    haystack = corpus.lower().replace(",", "")
+    found = []
+    for match in _SIZE_RE.finditer(evidence):
+        token = match.group(0).strip().lower().replace(",", "")
+        number = "".join(ch for ch in token if ch.isdigit() or ch == ".")
+        if not number:
+            continue
+        digits = number.split(".")[0]
+        if digits and digits not in haystack:
+            found.append(match.group(0))
+    return found

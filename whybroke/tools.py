@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -83,6 +84,220 @@ def read_log_file(args):
     if not content.strip():
         return "(file is empty)"
     return tail_lines(content, lines)
+
+
+def _human(num):
+    value = float(num)
+    for unit in ("B", "K", "M", "G", "T"):
+        if value < 1024 or unit == "T":
+            return "{:.1f}{}".format(value, unit) if unit != "B" else "{:.0f}B".format(value)
+        value /= 1024
+    return "{:.1f}T".format(value)
+
+
+def socket_inodes_for_port(port):
+    """Inodes of sockets bound to `port`, read from /proc so we need no privileges."""
+    wanted = format(port, "04X")
+    inodes = []
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(table) as handle:
+                rows = handle.read().splitlines()[1:]
+        except OSError:
+            continue
+        for row in rows:
+            fields = row.split()
+            if len(fields) < 10:
+                continue
+            local = fields[1].rsplit(":", 1)[-1]
+            if local == wanted and fields[3] == "0A":
+                inodes.append(fields[9])
+    return inodes
+
+
+def pid_owning_inodes(inodes):
+    """Map socket inodes to (pid, command) by walking /proc.
+
+    `ss -p` hides owners it cannot see, which silently turns a useful answer
+    into a generic one. Doing the lookup ourselves keeps the evidence honest
+    even when the port belongs to another user.
+    """
+    if not inodes:
+        return []
+    wanted = {"socket:[{}]".format(inode) for inode in inodes}
+    owners = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        fd_dir = os.path.join("/proc", entry, "fd")
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(os.path.join(fd_dir, fd))
+            except OSError:
+                continue
+            if target in wanted:
+                owners.append(entry)
+                break
+    resolved = []
+    for pid in owners:
+        try:
+            with open("/proc/{}/cmdline".format(pid), "rb") as handle:
+                cmd = handle.read().replace(b"\0", b" ").decode(errors="replace").strip()
+        except OSError:
+            cmd = "?"
+        resolved.append((pid, cmd))
+    return resolved
+
+
+def annotate_socket_owners(text, port):
+    if not port:
+        return text
+    inodes = socket_inodes_for_port(port)
+    owners = pid_owning_inodes(inodes)
+    note = ["", "port {} owner:".format(port)]
+    if owners:
+        for pid, cmd in owners[:5]:
+            note.append("  pid {} -> {}".format(pid, cmd or "(unknown)"))
+    else:
+        note.append(
+            "  no owning process visible to this user; the listener belongs to "
+            "another user or a process that just exited"
+        )
+    return text + "\n" + "\n".join(note)
+
+
+def run_argv_quiet(argv, timeout, drop_stderr=True):
+    """Run argv and keep stdout even when the exit code is nonzero.
+
+    Needed for du and find: a single unreadable subdirectory must not abort
+    the whole listing, because partial results are still useful evidence.
+    """
+    try:
+        proc = subprocess.run(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL if drop_stderr else subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        return "TOOL UNAVAILABLE: {} is not installed on this host".format(argv[0])
+    except subprocess.TimeoutExpired:
+        return "TOOL TIMEOUT: exceeded {}s limit for {}".format(timeout, argv[0])
+    except PermissionError:
+        return "TOOL ERROR: permission denied running {}".format(argv[0])
+
+    out = proc.stdout.strip()
+    if not out:
+        detail = (proc.stderr or "").strip()
+        if detail and not drop_stderr:
+            return "TOOL ERROR (exit {}): {}".format(proc.returncode, detail)
+        return ""
+    return out
+
+
+def scan_disk_usage(args):
+    """`du` sorted in Python. No pipe, so there is nothing for the model to inject."""
+    path = args["path"]
+    depth = args.get("depth", 1)
+    limit = args.get("limit", 20)
+
+    raw = run_argv_quiet(
+        ["du", "-x", "--max-depth", str(depth), "-B1", path], 20
+    )
+    if raw.startswith("TOOL "):
+        return raw
+    if not raw:
+        return "(no readable entries found under {})".format(path)
+
+    rows = []
+    grand_total = None
+    for line in raw.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        try:
+            size = int(parts[0].strip())
+        except ValueError:
+            continue
+        target = parts[1].strip()
+        if target == path:
+            grand_total = size
+            continue
+        rows.append((size, target))
+
+    if grand_total is None:
+        grand_total = sum(size for size, _ in rows)
+
+    # du at depth 1 reports subdirectories only, so loose files at the top
+    # level are invisible to it. Merge them in or the total lies.
+    loose = run_argv_quiet(
+        ["find", path, "-maxdepth", "1", "-xdev", "-type", "f", "-printf", "%s\t%p\n"],
+        10,
+    )
+    for line in loose.splitlines() if loose else []:
+        parts = line.split("\t", 1)
+        if len(parts) != 2:
+            continue
+        try:
+            rows.append((int(parts[0].strip()), parts[1].strip()))
+        except ValueError:
+            continue
+
+    rows.sort(reverse=True)
+    lines = ["total {} in {}".format(_human(grand_total), path), ""]
+    if not rows:
+        lines.append("(nothing found, directory may be empty or unreadable)")
+    for size, target in rows[:limit]:
+        lines.append("{:>9}  {}".format(_human(size), target))
+    return "\n".join(lines)
+
+
+def largest_files(args):
+    """Largest individual files under a directory, newest-independent, sorted by size."""
+    path = args["path"]
+    limit = args.get("limit", 10)
+    min_kb = args.get("min_size_kb", 0)
+
+    raw = run_argv_quiet(
+        [
+            "find", path,
+            "-xdev",
+            "-type", "f",
+            "-size", "+{}k".format(min_kb),
+            "-printf", "%s\t%TY-%Tm-%Td\t%p\n",
+        ],
+        20,
+    )
+    if raw.startswith("TOOL "):
+        return raw
+    if not raw:
+        return "(no files larger than {}KB found under {})".format(min_kb, path)
+
+    rows = []
+    for line in raw.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 3:
+            continue
+        try:
+            rows.append((int(fields[0]), fields[1], fields[2]))
+        except ValueError:
+            continue
+
+    rows.sort(reverse=True)
+    lines = [
+        "largest files under {} ({} found, showing {}):".format(path, len(rows), min(len(rows), limit)),
+        "",
+    ]
+    if not rows:
+        lines.append("(nothing readable)")
+    for size, mtime, target in rows[:limit]:
+        lines.append("{:>9}  {}  {}".format(_human(size), mtime, target))
+    return "\n".join(lines)
 
 
 def _obj(properties, required):
@@ -198,10 +413,66 @@ register(
 register(
     ToolSpec(
         name="disk_usage",
-        description="Show filesystem and inode usage for all mounted filesystems. Use when disk space or failed writes are suspected.",
+        description="Show filesystem usage and inode usage for all mounted filesystems. Use when disk space or failed writes are suspected.",
         parameters=_obj({}, []),
         read_only=True,
         build=lambda a: ["df", "-h"],
+        validators={},
+    )
+)
+
+register(
+    ToolSpec(
+        name="scan_disk_usage",
+        description="Find what is taking the most space inside one directory, largest first. Use when the user asks what is filling a folder such as their home directory or Downloads.",
+        parameters=_obj(
+            {
+                "path": _string(
+                    "absolute path to an existing directory, for example "
+                    + os.path.expanduser("~")
+                ),
+                "depth": _integer("how deep to descend, 1 or 2"),
+                "limit": _integer("how many entries to report, 1 to 50"),
+            },
+            ["path"],
+        ),
+        read_only=True,
+        build=lambda a: [],
+        validators={
+            "path": safety.check_disk_scan_path,
+            "depth": safety.int_arg("depth", 1, 2),
+            "limit": safety.int_arg("limit", 1, 50),
+        },
+        execute=scan_disk_usage,
+        timeout_s=25,
+    )
+)
+
+register(
+    ToolSpec(
+        name="largest_files",
+        description="List the largest individual files inside a directory, biggest first, with size and modified date. Use when the user asks which file is taking the most space, such as in their Downloads folder.",
+        parameters=_obj(
+            {
+                "path": _string(
+                    "absolute path to an existing directory, for example "
+                    + os.path.expanduser("~")
+                    + "/Downloads"
+                ),
+                "limit": _integer("how many files to list, 1 to 50"),
+                "min_size_kb": _integer("ignore files smaller than this, in KB"),
+            },
+            ["path"],
+        ),
+        read_only=True,
+        build=lambda a: [],
+        validators={
+            "path": safety.check_disk_scan_path,
+            "limit": safety.int_arg("limit", 1, 50),
+            "min_size_kb": safety.int_arg("min_size_kb", 0, 1024 * 1024),
+        },
+        execute=largest_files,
+        timeout_s=25,
     )
 )
 
@@ -250,7 +521,8 @@ register(
         build=lambda a: ["ss", "-tulnp"],
         validators={"port": safety.optional_port},
         postprocess=lambda text, args: tail_lines(
-            filter_port(text, args.get("port")), 60
+            annotate_socket_owners(filter_port(text, args.get("port")), args.get("port")),
+            60,
         ),
     )
 )

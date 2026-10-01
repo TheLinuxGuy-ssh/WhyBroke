@@ -17,7 +17,20 @@ def system_prompt(max_steps):
         "\n"
         "Rules:\n"
         "- Call exactly one tool per message.\n"
-        "- If a tool fails or returns nothing useful, try a different tool. Do not repeat it.\n"
+        "- If a tool is blocked or returns nothing useful, choose a DIFFERENT tool or "
+        "change an argument. Never repeat a call that was already refused.\n"
+        "- To find what is filling a folder, use scan_disk_usage with an absolute "
+        "path such as ~/Downloads or the home directory.\n"
+        "- To find which single file is biggest, use largest_files with that path.\n"
+        "- If you were told a service crashed, you MUST call service_status for that "
+        "unit and then unit_logs for the same unit. Do not name a cause before you "
+        "have read both.\n"
+        "- Only scan_disk_usage and read_log_file take a path. read_log_file reads "
+        "files under /var/log only.\n"
+        "- EVIDENCE must contain the literal text and numbers from the tool output, "
+        "not the tool call you made. If disk_usage printed a table, copy the "
+        "interesting row into EVIDENCE. Writing only the call name is a failed "
+        "diagnosis.\n"
         "- Quote exact log lines and metric values as evidence. Never invent evidence.\n"
         "- You have at most {} tool calls.\n"
         "\n"
@@ -52,6 +65,9 @@ class Agent:
         final_text = ""
         steps = 0
         nudges = 0
+        self._rejected = set()
+        self._rejected_names = []
+        self._collected = []
 
         while steps < self.max_steps:
             started = time.time()
@@ -97,7 +113,9 @@ class Agent:
                     "step {}/{} | empty reply from the model, forcing a "
                     "conclusion".format(steps + 1, self.max_steps)
                 )
-                final_text = self._force_conclusion(messages)
+                final_text = self._force_conclusion(
+                    messages, self._collected, list(self._rejected_names)
+                )
                 break
 
             messages.append(self._assistant_message(content, tool_calls))
@@ -105,7 +123,29 @@ class Agent:
             for call in tool_calls:
                 name, arguments = _split_call(call)
                 steps += 1
-                output, redacted, blocked = self._execute(name, arguments)
+                signature = (name, _stable_args(arguments))
+                if signature in self._rejected:
+                    output = (
+                        "BLOCKED AGAIN: you already tried this exact call and it was "
+                        "refused. Do not repeat it. Pick a different tool, change an "
+                        "argument, or conclude now with what you have."
+                    )
+                    blocked = True
+                    redacted = 0
+                    self.log("step {}/{} | repeat of a blocked call, refused".format(
+                        steps, self.max_steps
+                    ))
+                else:
+                    output, redacted, blocked = self._execute(name, arguments)
+                    if blocked:
+                        self._rejected.add(signature)
+                        self._rejected_names.append(
+                            "{}({})".format(name, _format_args(arguments))
+                        )
+                    elif len(self._collected) < 12:
+                        self._collected.append(
+                            "{} -> {}".format(name, output[:700])
+                        )
                 self.log(
                     "step {}/{} | {}({}) -> {} chars{} ({:.1f}s)".format(
                         steps,
@@ -129,14 +169,23 @@ class Agent:
                         "report format only.".format(self.max_steps),
                     }
                 )
-                final_text = self._force_conclusion(messages)
+                final_text = self._force_conclusion(
+                    messages, self._collected, list(self._rejected_names)
+                )
                 break
 
         if not final_text:
-            final_text = self._force_conclusion(messages)
+            final_text = self._force_conclusion(
+                messages, self._collected, list(self._rejected_names)
+            )
 
         self._save_transcript(question, messages, final_text)
         return final_text
+
+    @property
+    def corpus(self):
+        """All real tool output seen this run, for the grounding check."""
+        return "\n".join(self._collected)
 
     @staticmethod
     def _options(with_predict):
@@ -187,16 +236,32 @@ class Agent:
         except (OSError, ValueError) as exc:
             return "TOOL ERROR: {}".format(exc), 0, False
 
-    def _force_conclusion(self, messages):
+    def _force_conclusion(self, messages, collected=None, blocked=None):
+        guidance = (
+            "Give your final report now. Use only the five headings, no other text. "
+            "Copy the actual output values into EVIDENCE."
+        )
+        if collected:
+            guidance += (
+                "\nYou must build EVIDENCE only from these tool results and nothing else:"
+                + "\n".join(collected[-6:])
+                + "\nCopy exact numbers and paths from them. Do not invent any value."
+            )
+        else:
+            guidance += (
+                "\nNo tool has produced any output, so you have no evidence. Write "
+                "EVIDENCE: no tool produced output, then set CONFIDENCE: low. Do not "
+                "state any file size, path, or log line you did not actually read."
+            )
+        if blocked:
+            guidance += (
+                "\nThese calls were refused, do not claim their results: "
+                + ", ".join(blocked[:6])
+            )
+
         response = self.client.chat(
             model=self.model,
-            messages=messages + [
-                {
-                    "role": "user",
-                    "content": "Give your final report now. Use only the five "
-                    "headings, no other text.",
-                }
-            ],
+            messages=messages + [{"role": "user", "content": guidance}],
             options=self._options(with_predict=False),
         )
         return (response["message"].get("content") or "").strip()
@@ -320,3 +385,7 @@ def _split_call(call):
 def _format_args(arguments):
     parts = ["{}={!r}".format(key, arguments[key]) for key in sorted(arguments)]
     return ", ".join(parts) or "no args"
+
+
+def _stable_args(arguments):
+    return json.dumps(arguments, sort_keys=True, default=str)

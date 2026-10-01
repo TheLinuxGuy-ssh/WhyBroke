@@ -109,6 +109,42 @@ def check_log_path(value):
     )
 
 
+def check_disk_scan_path(value):
+    """Validate a directory for the disk scanner.
+
+    Must resolve to an existing directory inside one of DISK_SCAN_ROOTS after
+    symlink resolution. A leading `~` is expanded first, because models write
+    `~/Downloads` almost every time and rejecting that wastes the whole step.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise SafetyError("path must be a non-empty string")
+
+    candidate = os.path.expanduser(value.strip())
+    if candidate.startswith("~"):
+        raise SafetyError("path could not be expanded: {!r}".format(value))
+    if not os.path.isabs(candidate):
+        raise SafetyError(
+            "path must be absolute, got {!r}. try the full path such as {}".format(
+                value, os.path.join(os.path.expanduser("~"), "Downloads")
+            )
+        )
+
+    resolved = os.path.realpath(candidate.rstrip(os.sep) or candidate)
+    if not os.path.isdir(resolved):
+        raise SafetyError("not an existing directory: {}".format(resolved))
+
+    for root in config.DISK_SCAN_ROOTS:
+        real_root = os.path.realpath(root)
+        if resolved == real_root or resolved.startswith(real_root + os.sep):
+            return resolved
+
+    raise SafetyError(
+        "path {} is outside the scannable roots {}".format(
+            resolved, ", ".join(config.DISK_SCAN_ROOTS)
+        )
+    )
+
+
 def validate(spec, args):
     if not isinstance(args, dict):
         raise SafetyError("arguments must be an object, got {}".format(type(args).__name__))

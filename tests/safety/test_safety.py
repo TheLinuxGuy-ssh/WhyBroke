@@ -1,7 +1,18 @@
 import os
+import subprocess
+import sys
+import time
 import unittest
 
 from whybroke import agent, config, report, safety, tools
+
+FINAL_REPORT = (
+    "SYMPTOM: something is wrong.\n"
+    "EVIDENCE: unit_logs reported a bind failure.\n"
+    "LIKELY ROOT CAUSE: the port is taken.\n"
+    "SUGGESTED FIX: free the port.\n"
+    "CONFIDENCE: high, the log names it"
+)
 
 
 class RedactionTests(unittest.TestCase):
@@ -170,6 +181,41 @@ class RegistryTests(unittest.TestCase):
         for name, spec in tools.REGISTRY.items():
             self.assertTrue(spec.read_only, name)
 
+    def test_path_tools_are_contained(self):
+        """Anything taking a path must resolve inside an allowlist, not just parse."""
+        for name in ("read_log_file", "scan_disk_usage", "largest_files"):
+            spec = tools.REGISTRY[name]
+            self.assertIn("path", spec.parameters["properties"], name)
+            self.assertIn("path", spec.validators, name)
+
+    def test_disk_scan_rejects_outside_roots(self):
+        for attack in (
+            "/etc/shadow",
+            "/etc",
+            "/home/tlg/Downloads/../../../etc",
+            "/proc/self",
+            "relative/path",
+        ):
+            with self.assertRaises(safety.SafetyError, msg=attack):
+                safety.check_disk_scan_path(attack)
+
+    def test_disk_scan_expands_tilde(self):
+        """Models write ~/Downloads constantly, so it must work, not be rejected."""
+        self.assertEqual(
+            safety.check_disk_scan_path("~/Downloads"), os.path.expanduser("~/Downloads")
+        )
+
+    def test_disk_scan_rejects_non_directory(self):
+        with self.assertRaises(safety.SafetyError):
+            safety.check_disk_scan_path(os.path.expanduser("~/Downloads/../.bashrc"))
+
+    def test_largest_files_and_scan_are_read_only_executes(self):
+        """These must run du/find through argv, never through a shell."""
+        for name in ("largest_files", "scan_disk_usage"):
+            spec = tools.REGISTRY[name]
+            self.assertEqual(spec.build({"path": "/tmp"}), [], name)
+            self.assertTrue(callable(spec.execute), name)
+
     def test_every_tool_has_validators_for_schema_args(self):
         for name, spec in tools.REGISTRY.items():
             props = set(spec.parameters.get("properties", {}))
@@ -192,7 +238,7 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(schema["function"]["parameters"]["type"], "object")
 
     def test_expected_tool_count(self):
-        self.assertEqual(len(tools.REGISTRY), 12)
+        self.assertEqual(len(tools.REGISTRY), 14)
 
 
 class RunToolTests(unittest.TestCase):
@@ -263,6 +309,152 @@ class RepairTests(unittest.TestCase):
     def test_ignores_prose(self):
         self.assertIsNone(agent.repair_tool_call("no json here, the disk looks full"))
         self.assertIsNone(agent.repair_tool_call(""))
+
+
+class FabricationTests(unittest.TestCase):
+    """A small model inventing a file size is the worst failure mode."""
+
+    CORPUS = (
+        "largest files under /home/tlg/Downloads\n"
+        "743.0M  2026-10-01  /home/tlg/Downloads/kali-linux.iso\n"
+        "129.1M  2026-09-11  /home/tlg/Downloads/obsidian.AppImage"
+    )
+
+    def test_invented_size_is_caught(self):
+        found = report.ungrounded_evidence(
+            {"EVIDENCE": "the iso is 1000000000 bytes across 123456789 files"},
+            self.CORPUS,
+        )
+        self.assertTrue(found, found)
+
+    def test_real_size_passes(self):
+        self.assertEqual(
+            report.ungrounded_evidence(
+                {"EVIDENCE": "the iso is 743.0M and obsidian is 129.1M"},
+                self.CORPUS,
+            ),
+            [],
+        )
+
+    def test_no_corpus_means_no_claim(self):
+        self.assertEqual(
+            report.ungrounded_evidence({"EVIDENCE": "999.9M somewhere"}, ""), []
+        )
+
+    def test_evidence_without_numbers_passes(self):
+        self.assertEqual(
+            report.ungrounded_evidence(
+                {"EVIDENCE": "bind() failed with EADDRINUSE"}, self.CORPUS
+            ),
+            [],
+        )
+
+
+class SocketOwnerTests(unittest.TestCase):
+    def test_inode_lookup_for_a_live_port(self):
+        holder = subprocess.Popen(
+            [sys.executable, "-m", "http.server", "8123", "--bind", "127.0.0.1"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            for _ in range(30):
+                time.sleep(0.1)
+                inodes = tools.socket_inodes_for_port(8123)
+                if inodes:
+                    break
+            self.assertTrue(inodes, "no socket inode found for the live listener")
+
+            owners = tools.pid_owning_inodes(inodes)
+            self.assertTrue(owners, "owning pid not resolved")
+            pids = [pid for pid, _cmd in owners]
+            self.assertIn(str(holder.pid), pids)
+            self.assertTrue(any("http.server" in cmd for _pid, cmd in owners))
+        finally:
+            holder.terminate()
+            holder.wait(timeout=10)
+
+    def test_annotation_names_the_owner(self):
+        holder = subprocess.Popen(
+            [sys.executable, "-m", "http.server", "8124", "--bind", "127.0.0.1"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            for _ in range(30):
+                time.sleep(0.1)
+                if tools.socket_inodes_for_port(8124):
+                    break
+            annotated = tools.annotate_socket_owners("(socket row)", 8124)
+            self.assertIn("port 8124 owner:", annotated)
+            self.assertIn(str(holder.pid), annotated)
+        finally:
+            holder.terminate()
+            holder.wait(timeout=10)
+
+    def test_unknown_port_says_so_instead_of_guessing(self):
+        annotated = tools.annotate_socket_owners("", 65011)
+        self.assertIn("no owning process visible", annotated)
+
+
+class RepeatCallTests(unittest.TestCase):
+    def test_blocked_call_is_not_repeated(self):
+        from tests.test_agent import FakeClient, call, say
+
+        script = [
+            call("scan_disk_usage", path="/etc"),
+            call("scan_disk_usage", path="/etc"),
+            say(FINAL_REPORT),
+        ]
+        client = FakeClient(script)
+        diag = agent.Agent(client=client, model="fake", transcript_dir=None)
+        diag.investigate("what is taking space")
+        last = client.calls[-1]["messages"]
+        tool_msgs = [m["content"] for m in last if m.get("role") == "tool"]
+        self.assertEqual(len(tool_msgs), 2)
+        self.assertIn("INVALID ARGUMENTS", tool_msgs[0])
+        self.assertIn("BLOCKED AGAIN", tool_msgs[1])
+
+    def test_distinct_arguments_are_not_treated_as_repeat(self):
+        from tests.test_agent import FakeClient, call, say
+
+        script = [
+            call("scan_disk_usage", path="/etc"),
+            call("scan_disk_usage", path="/proc"),
+            say(FINAL_REPORT),
+        ]
+        client = FakeClient(script)
+        diag = agent.Agent(client=client, model="fake", transcript_dir=None)
+        diag.investigate("what is taking space")
+        tool_msgs = [
+            m["content"] for m in client.calls[-1]["messages"] if m.get("role") == "tool"
+        ]
+        self.assertIn("INVALID ARGUMENTS", tool_msgs[0])
+        self.assertIn("INVALID ARGUMENTS", tool_msgs[1])
+        self.assertNotIn("BLOCKED AGAIN", tool_msgs[1])
+
+    def test_collected_corpus_holds_only_successful_output(self):
+        from tests.test_agent import FakeClient, call, say
+
+        client = FakeClient(
+            [call("scan_disk_usage", path="/etc"), call("disk_usage"), say(FINAL_REPORT)]
+        )
+        diag = agent.Agent(client=client, model="fake", transcript_dir=None)
+        diag.investigate("what is taking space")
+        self.assertEqual(len(diag._collected), 1)
+        self.assertTrue(diag._collected[0].startswith("disk_usage"))
+        self.assertTrue(diag.corpus)
+
+    def test_forced_conclusion_tells_model_it_has_no_evidence(self):
+        from tests.test_agent import FakeClient, say
+
+        client = FakeClient([say(""), say(FINAL_REPORT)])
+        diag = agent.Agent(client=client, model="fake", transcript_dir=None)
+        diag.investigate("unknown thing")
+        nudges = [m["content"] for m in client.calls[-1]["messages"]]
+        self.assertTrue(
+            any("no evidence" in text.lower() for text in nudges), nudges[-1]
+        )
 
 
 class ReportTests(unittest.TestCase):

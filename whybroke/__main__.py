@@ -96,6 +96,25 @@ def main(argv=None):
     raw = diag.investigate(args.question)
     sections = report.parse(raw)
 
+    # A small model will sometimes invent a size it never read. Say so rather
+    # than presenting it as a finding.
+    fabricated = report.ungrounded_evidence(sections, diag.corpus)
+    if fabricated:
+        print(
+            "WARNING: the model cited {} that no tool returned ({}). "
+            "treat the evidence section as unreliable.".format(
+                ", ".join(fabricated), "invented"
+            ),
+            file=sys.stderr,
+        )
+        sections["EVIDENCE"] = (
+            "UNVERIFIED. The model cited values that no tool returned "
+            "({}). Re-run with a higher step cap or a larger model before "
+            "trusting this section. Original text kept below.\n\n{}".format(
+                ", ".join(fabricated), sections["EVIDENCE"]
+            )
+        )
+
     if not any(sections[h] != "Not identified" for h in report.HEADINGS):
         print(
             report.render(sections, args.question),
