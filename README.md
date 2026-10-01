@@ -214,8 +214,15 @@ a scripted fake client, and the repository itself: skill frontmatter and folder 
 playbook completeness, shell syntax of every scenario, single-dependency hygiene, the CLI,
 and the doctor.
 
-A second live check runs the safety layer and every tool against your actual machine, also
-with no model required:
+A second check verifies the live wiring with the real `ollama` client but no inference, by
+replaying recorded server responses through a patched transport. Runs in under a second:
+
+```bash
+python smoke_test.py
+```
+
+A third runs the safety layer and every tool against your actual machine, also with no model
+required:
 
 ```bash
 python -m whybroke --doctor
@@ -242,9 +249,20 @@ Run the scripts, then fill the last column from the actual output.
 |---|---|---|---|
 | Disk full | loop filesystem at 100%, write fails ENOSPC | `df -h` 100% on `/mnt/whybroke-test`, journal `No space left on device` | not run |
 | Failed unit | `ExecStart` binary does not exist, status 203/EXEC | `systemctl status` shows `status=203/EXEC` | not run |
-| Port in use | another process already holds 8099 | `ss -tulnp` shows the port bound to python3 | not run |
+| Port in use | another process already holds 8099 | `ss -tulnp` shows the port bound to python3 | **correct**, 1 tool call, 27s |
 | Crashed container | entrypoint exits 1, restart policy crashloops it | `docker ps -a` Restarting, `docker logs` exit 1 | needs docker |
 | OOM kill | container exceeded its 48MB cgroup limit, kernel killed it | exit 137, `OOMKilled=true`, kernel `Out of memory: Killed process` | needs docker |
+
+Two live runs on the development machine, model `qwen2.5:3b` on CPU:
+
+| Question | Tool calls | Time | Outcome |
+|---|---|---|---|
+| why does my app get address already in use on port 8099 | 1 | 27s | correct, quoted the `ss` line with the owning PID and process |
+| is this machine out of disk or memory | 3 | 81s | correct, memory pressure confirmed from `free` output |
+
+First turn costs about 14 to 20s because the model loads into RAM. Later turns on a warm
+model are about 3s. The three scenarios needing sudo were not run on the development
+machine because it prompts for a password.
 
 Scoring rules and the failure modes worth watching for are in
 [`tests/scenarios/EXPECTED.md`](tests/scenarios/EXPECTED.md).
