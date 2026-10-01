@@ -217,7 +217,13 @@ class Agent:
 
     @staticmethod
     def _tool_message(name, output):
-        return {"role": "tool", "name": name, "content": output}
+        """Send both key spellings so 0.3.x and 0.6.x clients both work.
+
+        ollama renamed the field from `name` to `tool_name`. The client models
+        it with pydantic, which ignores the key it does not know, so sending
+        both is safe on either version.
+        """
+        return {"role": "tool", "name": name, "tool_name": name, "content": output}
 
     def _save_transcript(self, question, messages, final_text):
         if not self.transcript_dir:
